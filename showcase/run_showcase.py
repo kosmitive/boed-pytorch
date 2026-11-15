@@ -30,13 +30,16 @@ from matplotlib.patches import Ellipse
 from torch import Tensor
 
 from showcase.estimators import (
+    ImplicitLikelihood,
     MarginalNetwork,
     PosteriorNetwork,
+    estimate_implicit,
     estimate_marginal,
     estimate_posterior,
     estimate_vnmc,
     nested_monte_carlo,
     nmc_versus_inner,
+    train_implicit,
     train_marginal,
     train_posterior,
     train_vnmc,
@@ -88,6 +91,7 @@ COLOR_POSTERIOR = "#0072B2"
 COLOR_MARGINAL = "#E69F00"
 COLOR_VNMC = "#009E73"
 COLOR_NMC = "#D55E00"
+COLOR_IMPLICIT = "#56B4E9"
 COLOR_RANDOM = "#0072B2"
 COLOR_VARIATIONAL = "#CC79A7"
 
@@ -141,7 +145,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _train_amortized() -> dict[str, object]:
-    """Fit the three variational estimators under the standard prior."""
+    """Fit the variational estimators under the standard prior."""
     _seed(SEED)
     mean, cov = standard_prior()
     common = {
@@ -169,15 +173,18 @@ def _train_amortized() -> dict[str, object]:
         eval_inner=16,
         **common,
     )
+    implicit, implicit_history = train_implicit(mean, cov, steps=TRAIN_STEPS, lr=LEARNING_RATE, **common)
     return {
         "mean": mean,
         "cov": cov,
         "posterior": posterior,
         "marginal": marginal,
         "vnmc": vnmc,
+        "implicit": implicit,
         "posterior_history": posterior_history,
         "marginal_history": marginal_history,
         "vnmc_history": vnmc_history,
+        "implicit_history": implicit_history,
     }
 
 
@@ -189,9 +196,11 @@ def _write_eig_figure(trained: dict[str, object]) -> dict[str, object]:
     posterior = trained["posterior"]
     marginal = trained["marginal"]
     vnmc = trained["vnmc"]
+    implicit = trained["implicit"]
     assert isinstance(posterior, PosteriorNetwork)
     assert isinstance(marginal, MarginalNetwork)
     assert isinstance(vnmc, PosteriorNetwork)
+    assert isinstance(implicit, ImplicitLikelihood)
 
     grid = torch.linspace(DESIGN_LOW, DESIGN_HIGH, GRID_POINTS)
     truth_grid = torch.linspace(DESIGN_LOW, DESIGN_HIGH, 201)
@@ -201,6 +210,7 @@ def _write_eig_figure(trained: dict[str, object]) -> dict[str, object]:
     posterior_est = estimate_posterior(posterior, grid, mean, cov, SIGMA, EVAL_SAMPLES)
     marginal_est = estimate_marginal(marginal, grid, mean, cov, SIGMA, EVAL_SAMPLES)
     vnmc_est = estimate_vnmc(vnmc, grid, mean, cov, SIGMA, VNMC_EVAL_OUTER, VNMC_EVAL_INNER)
+    implicit_est = estimate_implicit(implicit, grid, mean, cov, SIGMA, EVAL_SAMPLES)
     nmc_est = nested_monte_carlo(grid, mean, cov, SIGMA, NMC_OUTER, NMC_INNER)
 
     fig, (ax, ax_err) = plt.subplots(
@@ -215,20 +225,23 @@ def _write_eig_figure(trained: dict[str, object]) -> dict[str, object]:
     _mark(ax, grid, posterior_est, COLOR_POSTERIOR, "o", "Posterior lower bound")
     _mark(ax, grid, marginal_est, COLOR_MARGINAL, "s", "Marginal upper bound")
     _mark(ax, grid, vnmc_est, COLOR_VNMC, "^", "VNMC")
+    _mark(ax, grid, implicit_est, COLOR_IMPLICIT, "D", "Implicit likelihood")
     _mark(ax, grid, nmc_est, COLOR_NMC, "x", f"NMC (M = {NMC_INNER})")
     ax.set_ylabel("EIG (nats)")
     ax.set_title(r"One measurement,  $y = \theta_0 + \theta_1 x + \varepsilon$")
-    ax.legend(loc="upper center", ncol=2)
+    ax.legend(loc="upper center", ncol=3)
 
     errors = {
         "posterior": posterior_est - truth,
         "marginal": marginal_est - truth,
         "vnmc": vnmc_est - truth,
+        "implicit": implicit_est - truth,
         "nmc": nmc_est - truth,
     }
     _mark(ax_err, grid, errors["posterior"], COLOR_POSTERIOR, "o", "Posterior")
     _mark(ax_err, grid, errors["marginal"], COLOR_MARGINAL, "s", "Marginal")
     _mark(ax_err, grid, errors["vnmc"], COLOR_VNMC, "^", "VNMC")
+    _mark(ax_err, grid, errors["implicit"], COLOR_IMPLICIT, "D", "Implicit likelihood")
     _mark(ax_err, grid, errors["nmc"], COLOR_NMC, "x", "NMC")
     ax_err.axhline(0.0, color=COLOR_ANALYTIC, linewidth=1.0)
     ax_err.set_xlabel("design  x")
@@ -263,7 +276,9 @@ def _write_convergence_figure(trained: dict[str, object]) -> dict[str, object]:
     truth = float(analytic_eig(torch.tensor(REFERENCE_X), cov, SIGMA))
     posterior_history = trained["posterior_history"]
     marginal_history = trained["marginal_history"]
+    implicit_history = trained["implicit_history"]
     assert isinstance(posterior_history, list) and isinstance(marginal_history, list)
+    assert isinstance(implicit_history, list)
 
     print("Estimating inner-sample bias...", flush=True)
     _seed(SEED + 1)
@@ -273,12 +288,14 @@ def _write_convergence_figure(trained: dict[str, object]) -> dict[str, object]:
     fig, (ax_train, ax_inner) = plt.subplots(1, 2, figsize=(10.2, 4.3), constrained_layout=True)
     post_steps, post_values = _history_arrays(posterior_history)
     marg_steps, marg_values = _history_arrays(marginal_history)
+    implicit_steps, implicit_values = _history_arrays(implicit_history)
     ax_train.plot(post_steps, post_values, color=COLOR_POSTERIOR, label="Posterior lower bound")
     ax_train.plot(marg_steps, marg_values, color=COLOR_MARGINAL, label="Marginal upper bound")
+    ax_train.plot(implicit_steps, implicit_values, color=COLOR_IMPLICIT, label="Implicit likelihood")
     ax_train.axhline(truth, color=COLOR_ANALYTIC, linestyle="--", label=f"Closed form ({truth:.3f})")
     ax_train.set_xlabel("training step")
     ax_train.set_ylabel("EIG (nats)")
-    ax_train.set_title(f"Bounds at  x = {REFERENCE_X:g}")
+    ax_train.set_title(f"Training at  x = {REFERENCE_X:g}")
     ax_train.legend(loc="best")
 
     counts = list(INNER_COUNTS)
@@ -316,6 +333,7 @@ def _write_convergence_figure(trained: dict[str, object]) -> dict[str, object]:
         "reference_eig": round(truth, 4),
         "posterior_final": _final(posterior_history),
         "marginal_final": _final(marginal_history),
+        "implicit_final": _final(implicit_history),
         "nmc_mean_at_M": {str(m): round(float(v), 4) for m, v in zip(INNER_COUNTS, nmc_mean)},
         "vnmc_mean_at_M": {str(m): round(float(v), 4) for m, v in zip(INNER_COUNTS, vnmc_reps.mean(dim=0))},
     }
@@ -345,6 +363,19 @@ def _write_sequential_figure() -> dict[str, object]:
         scores = estimate_posterior(net, candidates, mean, cov, SIGMA, SEQUENTIAL_EVAL_SAMPLES)
         return candidates[int(torch.argmax(scores))]
 
+    def choose_implicit(mean: Tensor, cov: Tensor) -> Tensor:
+        model, _history = train_implicit(
+            mean,
+            cov,
+            sigma=SIGMA,
+            steps=SEQUENTIAL_TRAIN_STEPS,
+            batch_size=BATCH_SIZE,
+            lr=LEARNING_RATE,
+            verbose=False,
+        )
+        scores = estimate_implicit(model, candidates, mean, cov, SIGMA, SEQUENTIAL_EVAL_SAMPLES)
+        return candidates[int(torch.argmax(scores))]
+
     def choose_random(mean: Tensor, cov: Tensor) -> Tensor:
         del mean, cov
         return candidates[int(torch.randint(candidates.shape[0], ()))]
@@ -353,6 +384,8 @@ def _write_sequential_figure() -> dict[str, object]:
     analytic = _rollout(choose_analytic, true_theta, SEED + 20, "analytic")
     print("  variational policy", flush=True)
     variational = _rollout(choose_variational, true_theta, SEED + 21, "variational")
+    print("  implicit-likelihood policy", flush=True)
+    implicit = _rollout(choose_implicit, true_theta, SEED + 22, "implicit")
     random_runs = [
         _rollout(choose_random, true_theta, SEED + 100 + index, "random", quiet=True)
         for index in range(SEQUENTIAL_RANDOM_RUNS)
@@ -379,6 +412,17 @@ def _write_sequential_figure() -> dict[str, object]:
         markersize=8,
         label="Max EIG, posterior bound",
     )
+    ax_vol.plot(
+        experiments,
+        implicit["logdet"],
+        color=COLOR_IMPLICIT,
+        marker="s",
+        linestyle="none",
+        markerfacecolor="none",
+        markeredgewidth=1.5,
+        markersize=7,
+        label="Max EIG, implicit likelihood",
+    )
     ax_vol.fill_between(
         experiments,
         random_low.numpy(),
@@ -393,7 +437,7 @@ def _write_sequential_figure() -> dict[str, object]:
     ax_vol.set_title("Posterior volume")
     ax_vol.legend(loc="best", fontsize=8)
 
-    _draw_designs(ax_des, random_runs, analytic["designs"], variational["designs"])
+    _draw_designs(ax_des, random_runs, analytic["designs"], variational["designs"], implicit["designs"])
     ax_des.set_xlabel("experiment")
     ax_des.set_ylabel("chosen design  x")
     ax_des.set_title("Where each policy measures")
@@ -411,6 +455,14 @@ def _write_sequential_figure() -> dict[str, object]:
         linestyle="--",
         label="Posterior-bound EIG",
     )
+    _add_ellipse(
+        ax_ell,
+        implicit["mean"],
+        implicit["cov"],
+        color=COLOR_IMPLICIT,
+        linestyle=(0, (2, 1.5)),
+        label="Implicit-likelihood EIG",
+    )
     ax_ell.scatter([TRUE_THETA[0]], [TRUE_THETA[1]], color="black", marker="*", s=80, zorder=5, label="True θ")
     ax_ell.set_xlim(-3.2, 3.2)
     ax_ell.set_ylim(-3.2, 3.2)
@@ -426,11 +478,13 @@ def _write_sequential_figure() -> dict[str, object]:
     plt.close(fig)
     print(f"Wrote {path}", flush=True)
     return {
-        "analytic_designs": [round(x, 4) for x in analytic["designs"]],
-        "variational_designs": [round(x, 4) for x in variational["designs"]],
+        "analytic_designs": [round(float(x), 4) for x in analytic["designs"]],
+        "variational_designs": [round(float(x), 4) for x in variational["designs"]],
+        "implicit_designs": [round(float(x), 4) for x in implicit["designs"]],
         "final_logdet": {
             "analytic": round(analytic["logdet"][-1], 4),
             "variational": round(variational["logdet"][-1], 4),
+            "implicit": round(implicit["logdet"][-1], 4),
             "random_median": round(float(random_median[-1]), 4),
         },
     }
@@ -468,7 +522,14 @@ def _rollout(
     return {"logdet": logdet, "designs": designs, "mean": mean.detach(), "cov": cov.detach()}
 
 
-def _draw_designs(ax, random_runs: list[dict[str, object]], analytic: list[float], variational: list[float]) -> None:
+def _draw_designs(
+    ax,
+    random_runs: list[dict[str, object]],
+    analytic: list[float],
+    variational: list[float],
+    implicit: list[float],
+) -> None:
+    """Draw chosen designs for the random cloud and the three EIG policies."""
     steps = list(range(1, SEQUENTIAL_EXPERIMENTS + 1))
     for run in random_runs:
         designs = run["designs"]
@@ -476,6 +537,7 @@ def _draw_designs(ax, random_runs: list[dict[str, object]], analytic: list[float
         ax.scatter(steps, designs, s=10, color=COLOR_RANDOM, alpha=0.18, linewidths=0)
     ax.plot(steps, analytic, color=COLOR_ANALYTIC, marker="o", label="Closed-form EIG")
     ax.plot(steps, variational, color=COLOR_VARIATIONAL, marker="o", linestyle="--", label="Posterior-bound EIG")
+    ax.plot(steps, implicit, color=COLOR_IMPLICIT, marker="s", linestyle=":", label="Implicit-likelihood EIG")
     ax.scatter([], [], s=18, color=COLOR_RANDOM, label="Random")
     ax.legend(loc="best", fontsize=8)
 
@@ -543,7 +605,7 @@ def _print_summary(results: dict[str, object]) -> None:
     eig = results.get("eig")
     if isinstance(eig, dict):
         print("EIG grid, max |estimate − truth|:", flush=True)
-        for name in ("posterior", "marginal", "vnmc", "nmc"):
+        for name in ("posterior", "marginal", "vnmc", "implicit", "nmc"):
             stats = eig.get(name)
             if isinstance(stats, dict):
                 print(f"  {name:10s}  {stats['max_abs_error']:.4f}   mean error {stats['mean_error']:+.4f}", flush=True)

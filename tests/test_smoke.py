@@ -8,10 +8,13 @@ import torch
 from torch.distributions import MultivariateNormal
 
 from showcase.estimators import (
+    ImplicitLikelihood,
+    estimate_implicit,
     estimate_marginal,
     estimate_posterior,
     nested_monte_carlo,
     scale_tril,
+    train_implicit,
     train_marginal,
     train_posterior,
 )
@@ -142,6 +145,29 @@ def test_short_training_moves_the_bounds_toward_the_truth() -> None:
     assert posterior_end < truth + 0.08
     assert marginal_end < marginal_start - 0.1
     assert marginal_end > truth - 0.08
+
+
+def test_implicit_likelihood_starts_at_zero_and_learns() -> None:
+    torch.manual_seed(0)
+    mean, cov = standard_prior()
+    truth = float(analytic_eig(torch.tensor(1.5), cov, sigma=1.0))
+    fresh = ImplicitLikelihood()
+    initial = float(estimate_implicit(fresh, torch.tensor([1.5]), mean, cov, n_samples=2048)[0])
+    assert abs(initial) < 0.02
+    _model, history = train_implicit(
+        mean,
+        cov,
+        steps=40,
+        batch_size=256,
+        lr=5e-3,
+        x_fixed=1.5,
+        eval_every=40,
+        eval_samples=2000,
+    )
+    start, end = history[0][1], history[-1][1]
+    assert abs(start) < 0.05
+    assert abs(end - truth) < abs(start - truth) - 0.25
+    assert abs(end - truth) < 0.25
 
 
 def test_params_to_flat_replaces_a_missing_gradient() -> None:

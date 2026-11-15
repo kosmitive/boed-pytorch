@@ -1,14 +1,17 @@
-"""Posterior, marginal, VNMC, and nested Monte Carlo estimators of EIG.
+"""Posterior, marginal, VNMC, implicit-likelihood, and nested Monte Carlo estimators.
 
 The objectives follow Foster et al., NeurIPS 2019. For the linear-Gaussian
-model in :mod:`showcase.model` the posterior and the marginal are both
-Gaussian, so a small network that emits a Gaussian can make each bound tight.
+model in :mod:`showcase.model` the posterior, the marginal, and the likelihood
+are all Gaussian, so a small network that emits a Gaussian can make each
+estimator tight.
 
 * Posterior lower bound: ``E[log q(θ | y, x) − log p(θ)]``.
 * Marginal upper bound: ``E[log p(y | θ, x) − log q(y | x)]``.
 * VNMC upper bound: the nested Monte Carlo contrast, with inner samples drawn
   from ``q(θ | y, x)`` instead of the prior.
-* Nested Monte Carlo: the same contrast with inner samples drawn from the prior.
+* Implicit likelihood: ``E[log q_ℓ(y | θ, x) − log q_m(y | x)]``. This is the
+  estimator in ``src/vimp.py``. It can sit on either side of the EIG.
+* Nested Monte Carlo: the VNMC contrast with inner samples drawn from the prior.
   It is biased high for a finite inner-sample count.
 """
 
@@ -144,6 +147,54 @@ class MarginalNetwork(nn.Module):
         mean = self.mean_head(hidden).squeeze(-1)
         std = F.softplus(self.scale_head(hidden).squeeze(-1)) + 1e-5
         return Normal(mean, std)
+
+
+class LikelihoodNetwork(nn.Module):
+    """Amortized univariate Gaussian ``q(y | θ, x)``."""
+
+    def __init__(self, hidden: int = 48) -> None:
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Linear(3, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+        )
+        self.mean_head = nn.Linear(hidden, 1)
+        self.scale_head = nn.Linear(hidden, 1)
+        nn.init.zeros_(self.mean_head.weight)
+        nn.init.zeros_(self.mean_head.bias)
+        nn.init.zeros_(self.scale_head.weight)
+        nn.init.constant_(self.scale_head.bias, _SOFTPLUS_OF_ONE)
+
+    def forward(self, theta: Tensor, x: Tensor) -> Normal:
+        """Return the variational likelihood at each ``(θ, x)`` pair.
+
+        Args:
+            theta: Parameters of shape (batch, 2).
+            x: Designs of shape (batch,).
+
+        Returns:
+            A batch of univariate normals over ``y``.
+        """
+        hidden = self.backbone(torch.cat((theta, x.unsqueeze(-1)), dim=-1))
+        mean = self.mean_head(hidden).squeeze(-1)
+        std = F.softplus(self.scale_head(hidden).squeeze(-1)) + 1e-5
+        return Normal(mean, std)
+
+
+class ImplicitLikelihood(nn.Module):
+    """Likelihood and marginal networks for the implicit-likelihood EIG.
+
+    The estimate is ``E[log q_ℓ(y | θ, x) − log q_m(y | x)]``. Training
+    maximises the sum of the two log-densities, which is the loss in
+    ``src/vimp.py``.
+    """
+
+    def __init__(self, hidden: int = 48) -> None:
+        super().__init__()
+        self.likelihood = LikelihoodNetwork(hidden)
+        self.marginal = MarginalNetwork(hidden)
 
 
 def estimate_posterior(
@@ -463,6 +514,109 @@ def train_marginal(
 
     history = _fit(net, loss_fn, steps, batch_size, lr, eval_every, eval_fn if anchor is not None else None, verbose, "marginal")
     return net, history
+
+
+def estimate_implicit(
+    model: ImplicitLikelihood,
+    x: Tensor,
+    prior_mean: Tensor,
+    prior_cov: Tensor,
+    sigma: float = SIGMA,
+    n_samples: int = 4096,
+) -> Tensor:
+    """Monte Carlo estimate of the implicit-likelihood EIG at each design.
+
+    Args:
+        model: Trained likelihood and marginal networks.
+        x: Designs of shape (g,).
+        prior_mean: Prior mean.
+        prior_cov: Prior covariance.
+        sigma: Observation-noise standard deviation.
+        n_samples: Joint samples per design.
+
+    Returns:
+        EIG estimate per design, shape (g,). The contrast is not a bound.
+    """
+    return _repeat_estimate(
+        x,
+        n_samples,
+        lambda x_rep, theta, y: (
+            model.likelihood(theta, x_rep).log_prob(y) - model.marginal(x_rep).log_prob(y)
+        ),
+        prior_mean,
+        prior_cov,
+        sigma,
+    )
+
+
+def train_implicit(
+    prior_mean: Tensor,
+    prior_cov: Tensor,
+    sigma: float = SIGMA,
+    steps: int = 400,
+    batch_size: int = 512,
+    lr: float = 4e-3,
+    x_fixed: float | None = None,
+    reference_x: float | None = None,
+    eval_every: int = 0,
+    eval_samples: int = 2048,
+    verbose: bool = False,
+    low: float = DESIGN_LOW,
+    high: float = DESIGN_HIGH,
+) -> tuple[ImplicitLikelihood, list[tuple[int, float]]]:
+    """Fit the implicit-likelihood pair by maximum likelihood.
+
+    Both networks start as the same ``Normal(0, 1)``, so the ratio starts at
+    zero. The training loss is the sum of the two negative log-densities.
+
+    Args:
+        prior_mean: Prior mean.
+        prior_cov: Prior covariance.
+        sigma: Observation-noise standard deviation.
+        steps: Gradient steps.
+        batch_size: Joint samples per step.
+        lr: Adam learning rate.
+        x_fixed: Train at one design. ``None`` draws designs uniformly.
+        reference_x: Design at which the estimate is recorded.
+        eval_every: Record the estimate every this many steps. Zero disables it.
+        eval_samples: Samples used for each recorded estimate.
+        verbose: Print recorded estimates.
+        low: Lower end of the design range used when ``x_fixed`` is omitted.
+        high: Upper end of that design range.
+
+    Returns:
+        The trained pair and a list of ``(step, estimate)`` pairs.
+    """
+    mean = prior_mean.detach()
+    cov = prior_cov.detach()
+    model = ImplicitLikelihood()
+    anchor = reference_x if reference_x is not None else x_fixed
+
+    def loss_fn(batch: int) -> Tensor:
+        x = _sample_designs(batch, x_fixed, low, high)
+        theta = sample_gaussian(mean, cov, batch)
+        y = sample_outcome(theta, x, sigma)
+        log_density = model.likelihood(theta, x).log_prob(y) + model.marginal(x).log_prob(y)
+        return -log_density.mean()
+
+    def eval_fn() -> float:
+        assert anchor is not None
+        with torch.no_grad():
+            value = estimate_implicit(model, torch.tensor([anchor]), mean, cov, sigma, eval_samples)
+        return float(value[0])
+
+    history = _fit(
+        model,
+        loss_fn,
+        steps,
+        batch_size,
+        lr,
+        eval_every,
+        eval_fn if anchor is not None else None,
+        verbose,
+        "implicit",
+    )
+    return model, history
 
 
 def train_vnmc(

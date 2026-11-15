@@ -4,20 +4,24 @@
   "reference_design": 1.5,
   "eig": {
     "posterior": {
-      "max_abs_error": 0.0213,
-      "mean_error": -0.005
+      "max_abs_error": 0.0228,
+      "mean_error": -0.0033
     },
     "marginal": {
-      "max_abs_error": 0.0162,
-      "mean_error": -0.0014
+      "max_abs_error": 0.0138,
+      "mean_error": 0.0007
     },
     "vnmc": {
-      "max_abs_error": 0.0509,
-      "mean_error": 0.0041
+      "max_abs_error": 0.032,
+      "mean_error": 0.006
+    },
+    "implicit": {
+      "max_abs_error": 0.0317,
+      "mean_error": -0.0062
     },
     "nmc": {
-      "max_abs_error": 0.0458,
-      "mean_error": 0.0145
+      "max_abs_error": 0.0417,
+      "mean_error": 0.0077
     },
     "reference_x": 1.5,
     "reference_eig": 0.7235
@@ -26,6 +30,7 @@
     "reference_eig": 0.7235,
     "posterior_final": 0.7343,
     "marginal_final": 0.7338,
+    "implicit_final": 0.7098,
     "nmc_mean_at_M": {
       "1": 3.2127,
       "2": 1.7608,
@@ -70,11 +75,22 @@
       -2.0,
       2.0
     ],
+    "implicit_designs": [
+      1.8,
+      -2.0,
+      2.0,
+      -2.0,
+      1.4,
+      -1.6,
+      1.0,
+      -1.6
+    ],
     "final_logdet": {
       "analytic": -5.6937,
       "variational": -5.6937,
+      "implicit": -5.3839,
       "random_median": -4.7146
     }
   },
-  "seconds": 8.2
+  "seconds": 11.8
 }
