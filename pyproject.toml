@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boed-pytorch"
+version = "0.2.0"
+description = "Variational estimators of expected information gain for Bayesian optimal experimental design."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Markus Semmler"}]
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "showcase*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
