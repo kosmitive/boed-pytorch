@@ -1,12 +1,19 @@
-import torch
+"""Variational posterior lower bound on the EIG (Foster et al., 2019).
+
+The script ascends a design matrix for a Laplace-prior linear model.
+Run from the repository root::
+
+    python -m src.vpost --steps 100
+"""
+
+import argparse
+
 import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributions as dist
-import matplotlib.pyplot as plt
-
-from src.params_to_flat import params_to_flat
 
 p = 2
 n = 10
@@ -36,8 +43,19 @@ vpost_l_s = nn.Linear(64, int(p * (p + 1) / 2))
 vpost_nn_params = list(vpost_l_1.parameters()) + list(vpost_l_l2.parameters()) + list(vpost_l_mu.parameters()) + list(vpost_l_s.parameters())
 
 
-def calc_eig_vpost(xi):
+def _scale_tril(raw: torch.Tensor, dim: int, batch: int) -> torch.Tensor:
+    """Lower-triangular factor; diagonal first, then the strict lower triangle."""
+    factor = torch.zeros([batch, dim, dim])
+    factor[:, range(dim), range(dim)] = F.softplus(raw[:, range(dim)]) + 1e-6
+    cursor = dim
+    for row in range(1, dim):
+        width = row
+        factor[:, row, :row] = raw[:, cursor:cursor + width]
+        cursor += width
+    return factor
 
+
+def calc_eig_vpost(xi):
     # structure
     nxi = torch.tanh(xi)
     w = dist_w.rsample([p, N])
@@ -57,16 +75,7 @@ def calc_eig_vpost(xi):
     mu = vpost_l_mu(ac2)
     s = vpost_l_s(ac2)
 
-    # build dist
-    SigmaR = torch.zeros([N, p, p])
-    SigmaR[:, range(p), range(p)] = F.softplus(s[:, range(p)]) + 1e-6
-    iv = od
-    for ip in range(1, p):
-        l = p - 1
-        SigmaR[:, ip, :ip - 1] = s[:, iv:iv + l]
-        iv += l
-
-    p_dist_th = dist.MultivariateNormal(mu, scale_tril=SigmaR)
+    p_dist_th = dist.MultivariateNormal(mu, scale_tril=_scale_tril(s, p, N))
     post_lp = p_dist_th.log_prob(w.T)
     prior_lp = dist_w.log_prob(w.T).sum(1)
     w = prior_lp - post_lp
@@ -79,32 +88,52 @@ def calc_eig_vpost(xi):
     return cur_eig, g1, g2
 
 
-opt_xi = optim.Adam([xi])
-opt_nn = optim.Adam(vpost_nn_params)
-vpost_opt_nn = optim.Adam(vpost_nn_params)
-best_ig = None
-T = 1.0
+def _save_design_plot(name: str) -> None:
+    """Write the current figure under ``artifacts/``."""
+    from pathlib import Path
 
-for it in range(100):
+    import matplotlib.pyplot as plt
 
-    opt_xi.zero_grad()
-    opt_nn.zero_grad()
+    out = Path("artifacts")
+    out.mkdir(exist_ok=True)
+    path = out / name
+    plt.savefig(path, dpi=140, bbox_inches="tight")
+    print(f"Wrote {path}")
 
-    fr = True
 
-    cur_ig, xi_grad, th_grad = calc_eig_vpost(xi)
-    print(cur_ig)
+def main(steps: int = 100) -> None:
+    """Ascend the design and the posterior network for ``steps`` iterations."""
+    import matplotlib
 
-    xi.grad = -xi_grad
-    for pa, v in zip(vpost_nn_params, th_grad):
-        pa.grad = -v.detach()
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-    opt_xi.step()
-    opt_nn.step()
+    opt_xi = optim.Adam([xi])
+    opt_nn = optim.Adam(vpost_nn_params)
+    for it in range(steps):
+        opt_xi.zero_grad()
+        opt_nn.zero_grad()
 
-des = torch.tanh(xi).detach().numpy()
-plt.figure()
-plt.scatter(des[:, 0], des[:, 1])
-plt.xlim([np.min(des[:, 0]) - 0.005, np.max(des[:, 0]) + 0.005])
-plt.ylim([np.min(des[:, 1]) - 0.005, np.max(des[:, 1]) + 0.005])
-plt.show()
+        cur_ig, xi_grad, th_grad = calc_eig_vpost(xi)
+        print(cur_ig)
+
+        xi.grad = -xi_grad
+        for pa, v in zip(vpost_nn_params, th_grad):
+            pa.grad = -v.detach()
+
+        opt_xi.step()
+        opt_nn.step()
+
+    des = torch.tanh(xi).detach().numpy()
+    plt.figure()
+    plt.scatter(des[:, 0], des[:, 1])
+    plt.xlim([np.min(des[:, 0]) - 0.005, np.max(des[:, 0]) + 0.005])
+    plt.ylim([np.min(des[:, 1]) - 0.005, np.max(des[:, 1]) + 0.005])
+    _save_design_plot("vpost_design.png")
+    plt.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--steps", type=int, default=100)
+    main(steps=parser.parse_args().steps)

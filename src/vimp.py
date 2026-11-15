@@ -1,13 +1,29 @@
-import torch
+"""Implicit-likelihood EIG estimator (Foster et al., 2019, μ_{m+ℓ}).
+
+Two networks stand in for the likelihood and the marginal when the
+likelihood cannot be evaluated. The optional conjugate-gradient block is the
+implicit-gradient correction from differentiating through a trained network;
+it is off by default, as in the original script.
+
+Run from the repository root::
+
+    python -m src.vimp --steps 100
+"""
+
+import argparse
+
 import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributions as dist
-import matplotlib.pyplot as plt
 from scipy.sparse.linalg import LinearOperator, cg
 
-from src.params_to_flat import params_to_flat
+try:
+    from .params_to_flat import params_to_flat
+except ImportError:  # ``python src/vimp.py`` puts this directory on the path
+    from params_to_flat import params_to_flat
 
 p = 2
 n = 30
@@ -35,22 +51,23 @@ class MarginalNetwork(nn.Module):
 
     def forward(self, x):
 
-        if len(x.shape) == 1: x = x.reshape([1, -1])
+        if len(x.shape) == 1:
+            x = x.reshape([1, -1])
         a1 = torch.tanh(self.l1(x))
         a2 = torch.tanh(self.l2(a1))
         mu = self.l_mu(a2)
         sigma = self.l_sigma(a2)
 
-        # build dist
-        Sigma = torch.zeros([self.N, self.out_dim, self.out_dim])
-        Sigma[:, range(self.out_dim), range(self.out_dim)] = F.softplus(sigma[:, :self.out_dim]) + 1e-6
-        iv = self.out_dim
-        for ip in range(1, self.out_dim):
-            l = ip - 1
-            Sigma[:, ip, :ip-1] = sigma[:, iv:iv + l]
-            iv += l
+        # Full Cholesky factor: diagonal first, then row-wise strict lower entries.
+        factor = torch.zeros([self.N, self.out_dim, self.out_dim])
+        factor[:, range(self.out_dim), range(self.out_dim)] = F.softplus(sigma[:, :self.out_dim]) + 1e-6
+        cursor = self.out_dim
+        for row in range(1, self.out_dim):
+            width = row
+            factor[:, row, :row] = sigma[:, cursor:cursor + width]
+            cursor += width
 
-        p_dist_y = dist.MultivariateNormal(mu, scale_tril=Sigma)
+        p_dist_y = dist.MultivariateNormal(mu, scale_tril=factor)
         return p_dist_y
 
 # define the marginal networks
@@ -93,7 +110,7 @@ def eig(xi, ql, qm):
 
         def hvp_m(v):
             v1 = torch.autograd.grad(torch.sum(torch.tensor(v) * g3), qm.parameters(), retain_graph=True)
-            return params_to_flat(v1, ql.parameters()).detach().numpy()
+            return params_to_flat(v1, qm.parameters()).detach().numpy()
 
         def jvp(v, g):
             v1 = torch.autograd.grad(torch.sum(v.detach() * g), xi, retain_graph=True)[0]
@@ -117,63 +134,79 @@ def eig(xi, ql, qm):
     return ig, g1, g2_o, g3_o, loss
 
 
-opt_xi = optim.SGD([xi], lr=1e-2)
-opt_qm = optim.SGD(qm.parameters(), lr=1e-5)
-opt_ql = optim.SGD(ql.parameters(), lr=1e-5)
-best_ig = None
-T = 1.0
+def _save_design_plot(name: str) -> None:
+    """Write the current figure under ``artifacts/``."""
+    from pathlib import Path
 
-for out in range(100):
-    for it in range(10):
+    import matplotlib.pyplot as plt
 
-        opt_xi.zero_grad()
-        opt_qm.zero_grad()
-        opt_ql.zero_grad()
-
-        fr = True
-
-        cur_ig, xi_grad, th_grad, th_grad_m, loss = eig(xi, ql, qm)
-        print("ig=" + str(cur_ig) + ", loss=" + str(loss))
+    out = Path("artifacts")
+    out.mkdir(exist_ok=True)
+    path = out / name
+    plt.savefig(path, dpi=140, bbox_inches="tight")
+    print(f"Wrote {path}")
 
 
-        xi.grad = -xi_grad
-        for pa, v in zip(ql.parameters(), th_grad):
-            pa.grad = -v.detach()
+def main(steps: int = 100) -> None:
+    """Alternate design steps and network steps for ``steps`` outer cycles."""
+    import matplotlib
 
-        for pa, v in zip(qm.parameters(), th_grad_m):
-            pa.grad = -v.detach()
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-        opt_xi.step()
-        #opt_qm.step()
-        #opt_ql.step()
+    opt_xi = optim.SGD([xi], lr=1e-2)
+    opt_qm = optim.SGD(qm.parameters(), lr=1e-5)
+    opt_ql = optim.SGD(ql.parameters(), lr=1e-5)
+    for out in range(steps):
+        for it in range(10):
 
-    for it in range(10):
+            opt_xi.zero_grad()
+            opt_qm.zero_grad()
+            opt_ql.zero_grad()
 
-        opt_xi.zero_grad()
-        opt_qm.zero_grad()
-        opt_ql.zero_grad()
+            cur_ig, xi_grad, th_grad, th_grad_m, loss = eig(xi, ql, qm)
+            print("ig=" + str(cur_ig.detach()) + ", loss=" + str(loss.detach()))
 
-        fr = True
+            xi.grad = -xi_grad
+            for pa, v in zip(ql.parameters(), th_grad):
+                pa.grad = -v.detach()
 
-        cur_ig, xi_grad, th_grad, th_grad_m, loss = eig(xi, ql, qm)
-        print("ig=" + str(cur_ig) + ", loss=" + str(loss))
+            for pa, v in zip(qm.parameters(), th_grad_m):
+                pa.grad = -v.detach()
 
-        xi.grad = -xi_grad
-        for pa, v in zip(ql.parameters(), th_grad):
-            pa.grad = -v.detach()
+            opt_xi.step()
 
-        for pa, v in zip(qm.parameters(), th_grad_m):
-            pa.grad = -v.detach()
+        for it in range(10):
 
-        #opt_xi.step()
-        opt_qm.step()
-        opt_ql.step()
+            opt_xi.zero_grad()
+            opt_qm.zero_grad()
+            opt_ql.zero_grad()
 
-des = torch.tanh(xi).detach().numpy()
-plt.figure()
-plt.scatter(des[:, 0], des[:, 1])
-x_lim = [np.min(des[:, 0]) - 0.005, np.max(des[:, 0]) + 0.005]
-y_lim = [np.min(des[:, 1]) - 0.005, np.max(des[:, 1]) + 0.005]
-plt.xlim(x_lim)
-plt.ylim(y_lim)
-plt.show()
+            cur_ig, xi_grad, th_grad, th_grad_m, loss = eig(xi, ql, qm)
+            print("ig=" + str(cur_ig.detach()) + ", loss=" + str(loss.detach()))
+
+            xi.grad = -xi_grad
+            for pa, v in zip(ql.parameters(), th_grad):
+                pa.grad = -v.detach()
+
+            for pa, v in zip(qm.parameters(), th_grad_m):
+                pa.grad = -v.detach()
+
+            opt_qm.step()
+            opt_ql.step()
+
+    des = torch.tanh(xi).detach().numpy()
+    plt.figure()
+    plt.scatter(des[:, 0], des[:, 1])
+    x_lim = [np.min(des[:, 0]) - 0.005, np.max(des[:, 0]) + 0.005]
+    y_lim = [np.min(des[:, 1]) - 0.005, np.max(des[:, 1]) + 0.005]
+    plt.xlim(x_lim)
+    plt.ylim(y_lim)
+    _save_design_plot("vimp_design.png")
+    plt.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--steps", type=int, default=100)
+    main(steps=parser.parse_args().steps)

@@ -127,3 +127,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Figures and traces produced by the original design-optimization scripts
+/artifacts/
