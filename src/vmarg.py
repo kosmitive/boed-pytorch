@@ -1,12 +1,19 @@
-import torch
+"""Variational marginal upper bound on the EIG (Foster et al., 2019).
+
+The script ascends a design matrix for a Laplace-prior linear model.
+Run from the repository root::
+
+    python -m src.vmarg --steps 100
+"""
+
+import argparse
+
 import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributions as dist
-import matplotlib.pyplot as plt
-
-from src.params_to_flat import params_to_flat
 
 p = 2
 n = 10
@@ -29,29 +36,30 @@ class MarginalNetwork(nn.Module):
         nn.Module.__init__(self)
         self.l1 = nn.Linear(inp_dim, hidden_dim)
         self.l2 = nn.Linear(hidden_dim, hidden_dim)
-        self.l_mu = nn.Linear(64, out_dim)
-        self.l_sigma = nn.Linear(64, int(out_dim * (out_dim + 1) / 2))
+        self.l_mu = nn.Linear(hidden_dim, out_dim)
+        self.l_sigma = nn.Linear(hidden_dim, int(out_dim * (out_dim + 1) / 2))
         self.out_dim = out_dim
         self.N = batch_shape
 
     def forward(self, x):
 
-        if len(x.shape) == 1: x = x.reshape([1, -1])
+        if len(x.shape) == 1:
+            x = x.reshape([1, -1])
         a1 = torch.tanh(self.l1(x))
         a2 = torch.tanh(self.l2(a1))
         mu = self.l_mu(a2)
         sigma = self.l_sigma(a2)
 
-        # build dist
-        Sigma = torch.zeros([self.N, self.out_dim, self.out_dim])
-        Sigma[:, range(self.out_dim), range(self.out_dim)] = F.softplus(sigma[:, :self.out_dim]) + 1e-6
-        iv = self.out_dim
-        for ip in range(1, self.out_dim):
-            l = ip - 1
-            Sigma[:, ip, :ip-1] = sigma[:, iv:iv + l]
-            iv += l
+        # Full Cholesky factor: diagonal first, then row-wise strict lower entries.
+        factor = torch.zeros([self.N, self.out_dim, self.out_dim])
+        factor[:, range(self.out_dim), range(self.out_dim)] = F.softplus(sigma[:, :self.out_dim]) + 1e-6
+        cursor = self.out_dim
+        for row in range(1, self.out_dim):
+            width = row
+            factor[:, row, :row] = sigma[:, cursor:cursor + width]
+            cursor += width
 
-        p_dist_y = dist.MultivariateNormal(mu, scale_tril=Sigma)
+        p_dist_y = dist.MultivariateNormal(mu, scale_tril=factor)
         return p_dist_y
 
 qmarg = MarginalNetwork(n * p, n, batch_shape=1)
@@ -72,7 +80,8 @@ def calc_eig_vmarg(xi):
     reshaped_xi = nxi.reshape([-1])
     p_dist_y = qmarg(reshaped_xi)
 
-    post_lp = p_dist_y.log_prob(y.unsqueeze(-1)).sum(0)
+    # y is (n, N); q(y | design) is one n-dimensional Gaussian.
+    post_lp = p_dist_y.log_prob(y.T)
     prior_lp = dist_y.log_prob(y).sum(0) / 0.5
     w = prior_lp - post_lp
     eig = torch.mean(w, dim=0)
@@ -83,31 +92,53 @@ def calc_eig_vmarg(xi):
 
     return cur_eig, g1, g2
 
-opt_xi = optim.Adam([xi])
-opt_nn = optim.Adam(qmarg.parameters())
-best_ig = None
-T = 1.0
 
-for it in range(100):
+def _save_design_plot(name: str) -> None:
+    """Write the current figure under ``artifacts/``."""
+    from pathlib import Path
 
-    opt_xi.zero_grad()
-    opt_nn.zero_grad()
+    import matplotlib.pyplot as plt
 
-    fr = True
+    out = Path("artifacts")
+    out.mkdir(exist_ok=True)
+    path = out / name
+    plt.savefig(path, dpi=140, bbox_inches="tight")
+    print(f"Wrote {path}")
 
-    cur_ig, xi_grad, th_grad = calc_eig_vmarg(xi)
-    print(cur_ig)
 
-    xi.grad = -xi_grad
-    for pa, v in zip(qmarg.parameters(), th_grad):
-        pa.grad = -v.detach()
+def main(steps: int = 100) -> None:
+    """Ascend the design and the marginal network for ``steps`` iterations."""
+    import matplotlib
 
-    opt_xi.step()
-    opt_nn.step()
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-des = torch.tanh(xi).detach().numpy()
-plt.figure()
-plt.scatter(des[:, 0], des[:, 1])
-plt.xlim([np.min(des[:, 0]) - 0.005, np.max(des[:, 0]) + 0.005])
-plt.ylim([np.min(des[:, 1]) - 0.005, np.max(des[:, 1]) + 0.005])
-plt.show()
+    opt_xi = optim.Adam([xi])
+    opt_nn = optim.Adam(qmarg.parameters())
+    for it in range(steps):
+        opt_xi.zero_grad()
+        opt_nn.zero_grad()
+
+        cur_ig, xi_grad, th_grad = calc_eig_vmarg(xi)
+        print(cur_ig)
+
+        xi.grad = -xi_grad
+        for pa, v in zip(qmarg.parameters(), th_grad):
+            pa.grad = -v.detach()
+
+        opt_xi.step()
+        opt_nn.step()
+
+    des = torch.tanh(xi).detach().numpy()
+    plt.figure()
+    plt.scatter(des[:, 0], des[:, 1])
+    plt.xlim([np.min(des[:, 0]) - 0.005, np.max(des[:, 0]) + 0.005])
+    plt.ylim([np.min(des[:, 1]) - 0.005, np.max(des[:, 1]) + 0.005])
+    _save_design_plot("vmarg_design.png")
+    plt.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--steps", type=int, default=100)
+    main(steps=parser.parse_args().steps)
